@@ -7,10 +7,16 @@ on:
       - '*'
   workflow_dispatch:
     inputs:
-      skipBinStrip:
-        description: 'Skip strip and upx'
+      stripBin:
+        description: 'Run strip on the binary.'
         required: false
-        default: 'false'
+        default: false
+        type: boolean
+
+      compressBin:
+        description: 'Compress binary using upx. Can cause malware false positives.'
+        required: false
+        default: false
         type: boolean
 
 jobs:
@@ -46,10 +52,10 @@ jobs:
   create-release:
     name: deploy
     needs: [style]
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     strategy:
       matrix:
-        target: [ x86_64-pc-windows-gnu ]
+        target: [ x86_64-pc-windows-msvc ]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -60,20 +66,21 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build target
-        uses: houseabsolute/actions-rust-cross@v0
+        uses: houseabsolute/actions-rust-cross@v1
         with:
           target: ${{ matrix.target }}
           args: --release --locked
+          strip: true
         env:
           IMGUR_CLIENT_ID: ${{ secrets.IMGUR_CLIENT_ID }}
 
       - name: Strip binary
-        if: ${{ inputs.skipBinStrip != 'true'}}
+        if: ${{ inputs.stripBin == 'true' }}
         run: strip "target/${{ matrix.target }}/release/imgur-uploader.exe"
 
       - name: Run UPX to reduce binary size
         uses: crazy-max/ghaction-upx@v3
-        if: ${{ inputs.skipBinStrip != 'true'}}
+        if: ${{ inputs.compressBin == 'true' }}
         with:
           version: latest
           files: 'target/${{ matrix.target }}/release/imgur-uploader.exe'
@@ -81,7 +88,7 @@ jobs:
 
       - name: Publish
         if: github.event_name != 'workflow_dispatch'
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
             files: 'target/${{ matrix.target }}/release/imgur-uploader.exe'
 

@@ -14,7 +14,8 @@ struct ImgurData {
 #[derive(Deserialize)]
 struct ImgurResponse {
     data: ImgurData,
-    success: bool,
+    // unused but can be added later if needed
+    //success: bool,
 }
 
 fn exit_with_message(message: String, exit_code: i32) {
