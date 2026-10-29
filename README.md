@@ -2,36 +2,40 @@
 
 Uploads an image from a local path, has the Internet Archive capture it, and
 prints the permanent `archive.org` URL. Built for the Discord Rich Presence
-plugin for foobar2000, which pipes an album art path in and uses the returned
+plugin for foobar2000, which passes an album art path in and uses the returned
 URL as the presence image.
 
 ## How it works
 
 1. Reads a file path from a positional argument, or one line from stdin.
-2. Uploads the file to the first host that accepts it, in this order:
-   imgur (optional), litterbox (72 hours), uguu (3 hours), 0x0.st (1 hour),
-   tmpfiles (1 hour), catbox. No flags are needed for this default behavior.
-3. Checks that the returned URL is a plain HTTPS URL on the expected host.
-4. Downscales the image to 160x160 by default (center crop, Lanczos3, lossy
-   WebP q90), then submits the URL to the Wayback Machine within the archive
-   budget.
-5. If a snapshot is produced, checks that the archived copy serves the image
-   and prints `https://web.archive.org/web/<timestamp>id_/<url>`. Otherwise it
-   prints the direct upload URL instead.
+2. If a previously uploaded URL is supplied, reuses it when it still serves an
+   image at or below the resize target (when resizing); otherwise it processes
+   the file again.
+3. Downscales the image: center-crops to a square and applies a Lanczos3 resize
+   to 160x160 by default, then encodes it as lossy WebP q90 (JPEG or PNG with
+   `--format`).
+4. Uploads the file to the first host that accepts it, in this order: imgur
+   (optional), litterbox (72 h), uguu (3 h), 0x0.st (1 h), tmpfiles (1 h),
+   catbox. With `--race`, all available hosts are attempted concurrently.
+5. Submits the URL to the Wayback Machine within the archive budget.
+6. If a snapshot is produced, verifies that the archived copy is an image and
+   prints `https://web.archive.org/web/<timestamp>id_/<url>`. Otherwise it
+   prints the direct upload URL.
 
-The uploader is designed for foo_discord_rich, which kills the process after
-10 seconds, so archiving gets an 8 second budget by default and the direct
-upload URL is used as a fallback. Discord's media proxy fetches that URL, so
-catbox is tried last: `files.catbox.moe` is not resolvable from some datacenter
-resolvers, which makes the image fail to load in Rich Presence.
+The uploader is designed for foo_discord_rich, whose default process timeout is
+10 seconds. Archiving therefore gets an 8-second budget and falls back to the
+direct URL; raise both values when configuring the fork (see below).
 
-If an upload or archive step fails, the next host is tried. The whole run is
-bounded by a single deadline. The intermediate upload expires on its own
-(litterbox, uguu, tmpfiles) or is deleted after the capture (0x0.st).
+An upload failure moves to the next host (or another racing host wins). An
+archive failure does not fail the run: the direct URL is printed and the exit
+code is 0. Every run is bounded by one deadline. Intermediate uploads expire on
+their own (litterbox, uguu, tmpfiles) or are deleted after the capture (0x0.st).
 
 ## Build
 
-Requires Rust 1.88 or newer (edition 2024).
+Requires Rust 1.88 or newer (edition 2024) and a C toolchain, because libwebp is
+linked statically: Visual Studio Build Tools with the C++ workload on Windows,
+`cc` elsewhere.
 
 ```sh
 cargo build --release --locked
@@ -49,13 +53,14 @@ Two invocation styles are supported: a path argument, or the path on stdin.
 
 ```sh
 archive-uploader.exe "C:\Music\Album\cover.jpg"
-# -> https://web.archive.org/web/20261029025557id_/https://litter.catbox.moe/ab12cd.jpg
+# -> https://web.archive.org/web/20261029025557id_/https://litter.catbox.moe/ab12cd.webp
 
 echo "C:\Music\Album\cover.jpg" | archive-uploader.exe
 ```
 
 A previously uploaded URL can be passed as a second positional argument. It is
-reused when it still serves the image; otherwise the file is uploaded again:
+reused when it still serves an image at or below the resize target; otherwise
+the file is uploaded again:
 
 ```sh
 archive-uploader.exe "C:\Music\Album\cover.jpg" "https://web.archive.org/web/..."
@@ -71,23 +76,24 @@ is written to stderr on success unless `--verbose` is used.
 
 ## foo_discord_rich (wsnrq fork)
 
-This fork substitutes `{filepath}`, `{url}` and `{blur_percent}` into the upload
-command and passes them as arguments instead of writing to stdin. Configure:
+The fork substitutes `{filepath}`, `{url}` and `{blur_percent}` and passes them
+as arguments instead of writing to stdin. A working custom command, with the
+fork's process timeout raised to 130 seconds in the Uploader tab:
 
 ```
-"C:\path\to\archive-uploader.exe" {filepath} {url}
+"C:\path\to\archive-uploader.exe" --race --deadline 120 --archive-budget 90 {filepath} {url}
 ```
 
-- When the cached URL is still reachable it is printed back unchanged, so no
-  re-upload happens.
-- A dead URL, an HTML response, or a `files.catbox.moe` URL causes a fresh
-  upload (catbox is unreachable from Discord's media proxy).
+- A cached URL is reused only if it still serves an image and, when resizing,
+  its dimensions are at or below the target. Dead URLs, HTML responses, and
+  `files.catbox.moe` URLs are replaced.
 - `{blur_percent}` is ignored; use the fork's bundled uploader if you need
   blurred artwork.
 - The fork merges stderr into stdout, so never pass `--verbose` to the command:
   any diagnostic text corrupts the URL it reads.
-- The fork's default process timeout is 10 seconds; the uploader aims to answer
-  within 8 and otherwise prints the direct URL.
+- Inspect cached URLs with the fork's title-format fields `%drp_artwork_url%`,
+  `%drp_artwork_mode%` and `%drp_blurred_artwork_url%`, or open
+  `%APPDATA%\foobar2000-v2\foo_discord_rich\image_hashes.json`.
 
 ## Parallel upload (--race)
 
@@ -100,27 +106,23 @@ sometimes 404.
 This avoids waiting on a slow or dead first host, but it sends the same file to
 every raced host on every upload. Those extra copies are not cleaned up
 (litterbox/uguu/tmpfiles expire; imgur and catbox copies persist), so use it
-only if the latency matters. Remaining uploads are terminated when the process
-exits after printing the result.
+only if latency matters. Remaining uploads are terminated when the process exits
+after printing the result.
 
 If the archive step fails, the direct fallback can be a catbox URL, which
 Discord's media proxy cannot resolve. The archive URL is the reliable result;
 use `--no-permanent` to keep catbox out of the race entirely.
 
-```
-"C:\path\to\archive-uploader.exe" --race --deadline 120 --archive-budget 90 {filepath} {url}
-```
-
 ## Options
 
 | Option | Description |
 | --- | --- |
-| `-v`, `--verbose` | Print progress and diagnostics to stderr |
-| `--deadline SECS` | Total time budget in seconds (default 60, max 3600) |
-| `--archive-budget SECS` | Seconds to spend on archiving before printing the direct URL (default 8, 0 = wait for `--deadline`) |
+| `-v`, `--verbose` | Print progress and diagnostics to stderr (do not use with the fork) |
+| `--deadline SECS` | Total process budget in seconds (default 60, max 3600) |
+| `--archive-budget SECS` | Archive deadline in seconds from process start (default 8, 0 = use `--deadline`) |
 | `--race` | Upload to all available hosts concurrently and use the first successful result |
-| `--resize PX` | Downscale artwork to PX (square, Lanczos3; default 160, 0 keeps the original) |
-| `--format FMT` | Resized output format: `webp` (lossy q90, default), `jpeg`, or `png` |
+| `--resize PX` | Center-crop and downscale to `PX x PX` (default 160, 0 keeps the original) |
+| `--format FMT` | Resized output: `webp` (lossy q90, default), `jpeg`, or `png` (lossless) |
 | `--skip-archive` | Print the direct host URL instead of archiving it |
 | `--no-permanent` | Skip catbox, whose anonymous uploads cannot be deleted |
 | `-h`, `--help` | Show help |
@@ -129,32 +131,31 @@ use `--no-permanent` to keep catbox out of the race entirely.
 
 - Wayback captures are permanent and public. Uploading an image publishes it,
   and a capture cannot be removed by this tool.
-- Catbox is tried last and anonymous catbox uploads are permanent and cannot
-  be deleted. Pass `--no-permanent` or set
-  `ARCHIVE_UPLOADER_NO_PERMANENT=1` to skip it entirely.
+- Catbox is last in the sequential chain and participates in a race unless
+  `--no-permanent` or `ARCHIVE_UPLOADER_NO_PERMANENT=1` is set. Anonymous catbox
+  uploads are permanent and cannot be deleted. `files.catbox.moe` also cannot be
+  resolved from some datacenter resolvers, including Discord's media proxy, so a
+  catbox URL is only a fallback when archiving fails.
 - Imgur uploads also persist after the run; the tool does not keep a delete
   token for them.
-- The host URLs are only needed until the capture completes; the returned URL
+- The direct URL is only needed until the capture completes. The returned URL
   points at archive.org, so a later host expiry does not break it.
-- If the uploaded URL is unreachable from the local machine but the host still
-  returned a valid URL, the Wayback Machine is asked to fetch it anyway; the
-  archived copy is then verified byte-for-byte by content type. A host that
-  answers with a 404 or a non-image body is rejected immediately.
-- Save Page Now requests are retried up to three times with backoff on
-  transient errors. HTTP 429 stops the retries.
-- If the archive is slow or unavailable, the tool exits 0 with the direct
-  upload URL instead of failing. That URL is temporary for the default hosts
-  (imgur, when configured, is the exception).
-- Supported inputs are PNG, JPEG, GIF, WebP, BMP, TIFF and SVG. Other files are
-  uploaded as `application/octet-stream` and accepted if the host serves them
-  back unchanged.
+- There is no local pre-verification on the archive path; the archived replay is
+  the authority and is checked by its image type. `--skip-archive` verifies the
+  direct URL instead.
+- Save Page Now requests are retried up to three times with backoff on transient
+  errors, including HTTP 503. HTTP 429 stops the retries.
+- If the archive is slow or unavailable, the tool exits 0 with the direct upload
+  URL instead of failing. That URL is temporary for litterbox, uguu and
+  tmpfiles; imgur and catbox are permanent.
+- Resized output is lossy WebP q90 by default. `--format png` preserves every
+  pixel; `--format jpeg` uses JPEG q90. Discord's external RPC URLs support
+  WebP (including animated WebP), AVIF, GIF, PNG and JPEG.
+- JPEG, PNG, BMP and TIFF sources are resized when larger than the target. GIF,
+  WebP and SVG sources are uploaded unchanged so animations and vectors are not
+  flattened; unknown files are uploaded as `application/octet-stream`.
 - Files larger than 128 MiB are rejected.
-- Discord requests the activity image at `size=160`, so the default `--resize
-  160` sends a pre-scaled, center-cropped image instead of letting the client
-  reduce a 3000 px source in one step. Pass `--resize 0` to upload the original
-  and keep the full-resolution archive capture. Resized output is lossy WebP
-  q90 by default; `--format jpeg` or `--format png` changes it. Discord's external
-  RPC URLs support WebP (including animated WebP), AVIF, GIF, PNG and JPEG.
-  GIF, animated WebP and SVG sources are uploaded unchanged.
-- Save Page Now rate limiting (HTTP 429 or 503) stops the run instead of
-  retrying every remaining host.
+- Discord requests the activity image at `size=160`, so the default
+  `--resize 160` sends a pre-scaled, center-cropped image instead of letting the
+  client reduce a 3000 px source in one step. Pass `--resize 0` to upload the
+  original and keep the full-resolution archive capture.
