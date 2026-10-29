@@ -112,6 +112,10 @@ impl Provider {
         matches!(self, Provider::Catbox)
     }
 
+    pub fn is_discord_safe(self) -> bool {
+        matches!(self, Provider::Imgur | Provider::Litterbox | Provider::Uguu)
+    }
+
     pub fn upload(
         self,
         client: &Client,
@@ -442,6 +446,16 @@ mod tests {
         assert!(validate_url("uguu", "https://d.uguu.se/ab.png", UGUU_HOSTS).is_ok());
         assert!(validate_url("uguu", "https://h.uguu.se/ab.png", UGUU_HOSTS).is_ok());
         assert!(validate_url("uguu", "https://uguu.se.evil.example/a.png", UGUU_HOSTS).is_err());
+    }
+
+    #[test]
+    fn discord_safe_providers() {
+        assert!(Provider::Imgur.is_discord_safe());
+        assert!(Provider::Litterbox.is_discord_safe());
+        assert!(Provider::Uguu.is_discord_safe());
+        assert!(!Provider::Oxo.is_discord_safe());
+        assert!(!Provider::Tmpfiles.is_discord_safe());
+        assert!(!Provider::Catbox.is_discord_safe());
     }
 
     #[test]

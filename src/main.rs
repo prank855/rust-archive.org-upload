@@ -39,6 +39,7 @@ struct Options {
     resize: u32,
     format: OutputFormat,
     archive_only: bool,
+    discord_safe: bool,
     path: Option<String>,
     cached_url: Option<String>,
     help: bool,
@@ -103,12 +104,36 @@ fn main() {
     let resize_target = (options.resize > 0).then_some(options.resize);
 
     if let Some(url) = &options.cached_url {
+        if (options.discord_safe || options.archive_only)
+            && !is_archive_url(url)
+            && cached_content_ok(&strict_client, url, resize_target, Duration::from_secs(3))
+        {
+            if options.verbose {
+                eprintln!("upgrading cached URL to an archive link");
+            }
+
+            if let Some(upgraded) =
+                upgrade_cached_url(&client, &strict_client, url, archive_deadline)
+            {
+                exit_with_message(upgraded, 0);
+            }
+
+            if options.verbose {
+                eprintln!("no archive link available for the cached URL");
+            }
+
+            if options.discord_safe && is_discord_safe_url(url) {
+                exit_with_message(url.clone(), 0);
+            }
+        }
+
         if should_reuse_url(
             &strict_client,
             url,
             kind,
             resize_target,
             options.archive_only,
+            options.discord_safe,
             Duration::from_secs(3),
         ) {
             exit_with_message(url.clone(), 0);
@@ -188,6 +213,7 @@ fn main() {
             .copied()
             .filter(|provider| provider.available())
             .filter(|provider| !(provider.is_permanent() && options.skip_permanent))
+            .filter(|provider| !options.discord_safe || provider.is_discord_safe())
             .collect();
 
         if candidates.is_empty() {
@@ -210,7 +236,7 @@ fn main() {
                     if options.verbose {
                         eprintln!("race winner: {} {}", winner.provider, winner.url);
                     }
-                    archive_or_print(
+                    if let Err(error) = archive_or_print(
                         &client,
                         &strict_client,
                         winner,
@@ -218,7 +244,9 @@ fn main() {
                         &options,
                         archive_deadline,
                         deadline,
-                    );
+                    ) {
+                        failures.push(error);
+                    }
                 }
                 Err(errors) => {
                     failures.extend(errors);
@@ -254,6 +282,16 @@ fn main() {
             continue;
         }
 
+        if options.discord_safe && !provider.is_discord_safe() {
+            if options.verbose {
+                eprintln!(
+                    "skip {}: not fetchable by Discord's media proxy",
+                    provider.name()
+                );
+            }
+            continue;
+        }
+
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining < Duration::from_secs(2) {
             failures.push(format!("{}: time budget exhausted", provider.name()));
@@ -279,7 +317,7 @@ fn main() {
             eprintln!("{} returned {}", uploaded.provider, uploaded.url);
         }
 
-        archive_or_print(
+        if let Err(error) = archive_or_print(
             &client,
             &strict_client,
             uploaded,
@@ -287,7 +325,10 @@ fn main() {
             &options,
             archive_deadline,
             deadline,
-        );
+        ) {
+            failures.push(error);
+            continue;
+        }
     }
 
     exit_with_message(
@@ -304,13 +345,32 @@ fn archive_or_print(
     options: &Options,
     archive_deadline: Instant,
     deadline: Instant,
-) -> ! {
+) -> Result<(), String> {
     if options.skip_archive {
         let check_timeout = deadline
             .saturating_duration_since(Instant::now())
             .min(URL_CHECK_TIMEOUT);
 
-        if let Err(error) = util::verify_image(strict_client, &uploaded.url, kind, check_timeout, 1)
+        if options.discord_safe {
+            if !is_discord_safe_url(&uploaded.url) {
+                return Err(format!(
+                    "{}: not a Discord-safe URL: {}",
+                    uploaded.provider, uploaded.url
+                ));
+            }
+
+            match util::verify_image(strict_client, &uploaded.url, kind, check_timeout, 1) {
+                Ok(()) | Err(util::VerifyError::Unreachable(_)) => {}
+                Err(error) => {
+                    return Err(format!(
+                        "{}: could not be verified: {}",
+                        uploaded.provider,
+                        error.message()
+                    ));
+                }
+            }
+        } else if let Err(error) =
+            util::verify_image(strict_client, &uploaded.url, kind, check_timeout, 1)
             && options.verbose
         {
             eprintln!(
@@ -334,6 +394,10 @@ fn archive_or_print(
 
     match archived {
         Ok(link) => {
+            if options.discord_safe && !is_discord_safe_url(&link) {
+                return Err(format!("archive URL is not Discord-safe: {}", link));
+            }
+
             if options.verbose {
                 eprintln!("archived {}", link);
             }
@@ -351,6 +415,43 @@ fn archive_or_print(
                     "error: no archive.org URL was produced\n".to_string()
                 };
                 exit_with_message(message, 1);
+            }
+
+            if options.discord_safe {
+                if options.verbose {
+                    eprintln!(
+                        "warning: {}; using the Discord-safe direct URL",
+                        error.message
+                    );
+                }
+
+                if !is_discord_safe_url(&uploaded.url) {
+                    return Err(format!(
+                        "{}: not a Discord-safe direct URL: {}",
+                        uploaded.provider, uploaded.url
+                    ));
+                }
+
+                let verify_timeout = deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_secs(2));
+
+                if verify_timeout.is_zero() {
+                    exit_with_message(uploaded.url, 0);
+                }
+
+                match util::verify_image(strict_client, &uploaded.url, kind, verify_timeout, 1) {
+                    Ok(()) | Err(util::VerifyError::Unreachable(_)) => {}
+                    Err(error) => {
+                        return Err(format!(
+                            "{}: direct URL could not be verified: {}",
+                            uploaded.provider,
+                            error.message()
+                        ));
+                    }
+                }
+
+                exit_with_message(uploaded.url, 0);
             }
 
             if options.verbose {
@@ -465,6 +566,7 @@ fn parse_args() -> Result<Options, String> {
         resize: DEFAULT_RESIZE_PX,
         format: OutputFormat::Webp,
         archive_only: false,
+        discord_safe: false,
         path: None,
         cached_url: None,
         help: false,
@@ -480,6 +582,9 @@ fn parse_args() -> Result<Options, String> {
             "--no-permanent" => options.skip_permanent = true,
             "--race" => options.race = true,
             "--archive-only" => options.archive_only = true,
+            "--discord-safe" | "--only-return-valid-discord-link" => {
+                options.discord_safe = true;
+            }
             "--resize" => {
                 let value = args
                     .next()
@@ -656,6 +761,7 @@ fn should_reuse_url(
     kind: Option<&sniff::ImageType>,
     target: Option<u32>,
     archive_only: bool,
+    discord_safe: bool,
     timeout: Duration,
 ) -> bool {
     if is_known_unreachable_for_discord(url) {
@@ -663,6 +769,10 @@ fn should_reuse_url(
     }
 
     if archive_only && !is_archive_url(url) {
+        return false;
+    }
+
+    if discord_safe && !is_discord_safe_url(url) {
         return false;
     }
 
@@ -691,6 +801,50 @@ fn should_reuse_url(
         Err(util::VerifyError::Mismatch(_)) => false,
         Err(util::VerifyError::Unreachable(_)) => true,
     }
+}
+
+fn cached_content_ok(client: &Client, url: &str, target: Option<u32>, timeout: Duration) -> bool {
+    match util::fetch_bytes(client, url, 32 * 1024, timeout) {
+        Ok((prefix, _)) => {
+            if sniff::looks_like_html(&prefix) {
+                return false;
+            }
+
+            if let Some(target) = target
+                && let Some((width, height)) = image_dimensions(&prefix)
+                && width.max(height) > target
+            {
+                return false;
+            }
+
+            true
+        }
+        Err(util::VerifyError::Mismatch(_)) => false,
+        Err(util::VerifyError::Unreachable(_)) => true,
+    }
+}
+
+fn upgrade_cached_url(
+    client: &Client,
+    strict_client: &Client,
+    url: &str,
+    deadline: Instant,
+) -> Option<String> {
+    let timeout = deadline
+        .saturating_duration_since(Instant::now())
+        .min(Duration::from_secs(4));
+
+    if !timeout.is_zero()
+        && let Some(archive_url) = archive::existing_snapshot(client, url, None, timeout)
+    {
+        return Some(archive_url);
+    }
+
+    if Instant::now() >= deadline {
+        return None;
+    }
+
+    archive::archive(client, strict_client, url, None, deadline).ok()
 }
 
 fn image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
@@ -781,6 +935,28 @@ fn is_archive_url(url: &str) -> bool {
         .ok()
         .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
         .is_some_and(|host| host == "web.archive.org")
+}
+
+fn is_discord_safe_url(url: &str) -> bool {
+    if url.chars().count() > 254 {
+        return false;
+    }
+
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+
+    if parsed.scheme() != "https" {
+        return false;
+    }
+
+    let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+
+    host == "web.archive.org"
+        || host == "i.imgur.com"
+        || host == "litter.catbox.moe"
+        || host == "uguu.se"
+        || host.ends_with(".uguu.se")
 }
 
 fn is_known_unreachable_for_discord(url: &str) -> bool {
@@ -877,6 +1053,23 @@ mod tests {
         assert!(
             classify_positionals(&args(&["a.jpg", "https://x/1.jpg", "https://x/2.jpg"])).is_err()
         );
+    }
+
+    #[test]
+    fn discord_safe_urls_are_recognized() {
+        assert!(is_discord_safe_url(
+            "https://web.archive.org/web/20261029053236id_/https://example.com/a.webp"
+        ));
+        assert!(is_discord_safe_url("https://d.uguu.se/a.webp"));
+        assert!(is_discord_safe_url("https://i.imgur.com/a.webp"));
+        assert!(is_discord_safe_url("https://litter.catbox.moe/a.webp"));
+        assert!(!is_discord_safe_url("https://files.catbox.moe/a.webp"));
+        assert!(!is_discord_safe_url("https://tmpfiles.org/dl/1/a.webp"));
+        assert!(!is_discord_safe_url("http://litter.catbox.moe/a.webp"));
+        assert!(!is_discord_safe_url(&format!(
+            "https://litter.catbox.moe/{}",
+            "a".repeat(300)
+        )));
     }
 
     #[test]

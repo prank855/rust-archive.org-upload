@@ -81,7 +81,7 @@ as arguments instead of writing to stdin. A working custom command, with the
 fork's process timeout raised to 130 seconds in the Uploader tab:
 
 ```
-"C:\path\to\archive-uploader.exe" --archive-only --race --deadline 120 --archive-budget 90 {filepath} {url}
+"C:\path\to\archive-uploader.exe" --discord-safe --race --deadline 120 --archive-budget 90 {filepath} {url}
 ```
 
 - A cached URL is reused only if it still serves an image and, when resizing,
@@ -93,6 +93,17 @@ fork's process timeout raised to 130 seconds in the Uploader tab:
   failure returns no URL, so nothing new is cached. Remove `{url}` from the
   command if you also want failures to leave the album unresolved instead of
   letting the fork reuse a previously cached URL.
+- `--discord-safe` (alias `--only-return-valid-discord-link`) restricts uploads
+  to hosts Discord's media proxy can fetch (imgur, litterbox, uguu) and checks
+  the final URL is HTTPS, at most 254 characters, and serves an image. It
+  prefers the archive URL and otherwise returns a verified direct URL from one
+  of those hosts; `files.catbox.moe`, tmpfiles and 0x0.st are excluded
+  (`litter.catbox.moe` is allowed).
+- With `--discord-safe` or `--archive-only`, a cached non-archive `{url}` is
+  upgraded: the tool asks the Wayback availability API for an existing snapshot
+  and otherwise attempts a capture. A successful upgrade returns the archive
+  URL; otherwise `--discord-safe` returns the direct URL when it is on the safe
+  allowlist, and unsafe cached URLs are regenerated.
 - The fork merges stderr into stdout, so never pass `--verbose` to the command:
   any diagnostic text corrupts the URL it reads.
 - Inspect cached URLs with the fork's title-format fields `%drp_artwork_url%`,
@@ -128,6 +139,7 @@ use `--no-permanent` to keep catbox out of the race entirely.
 | `--resize PX` | Center-crop and downscale to `PX x PX` (default 160, 0 keeps the original) |
 | `--format FMT` | Resized output: `webp` (lossy q90, default), `jpeg`, or `png` (lossless) |
 | `--archive-only` | Only print `web.archive.org` URLs; exit 1 instead of printing a direct upload URL |
+| `--discord-safe` | Only use hosts Discord can fetch and verify the final URL (alias: `--only-return-valid-discord-link`) |
 | `--skip-archive` | Print the direct host URL instead of archiving it |
 | `--no-permanent` | Skip catbox, whose anonymous uploads cannot be deleted |
 | `-h`, `--help` | Show help |

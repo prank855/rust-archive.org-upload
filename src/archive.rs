@@ -58,6 +58,41 @@ struct Snapshot {
     timestamp: String,
 }
 
+pub fn existing_snapshot(
+    client: &Client,
+    page_url: &str,
+    kind: Option<&ImageType>,
+    timeout: Duration,
+) -> Option<String> {
+    let response = client
+        .get(AVAILABILITY_URL)
+        .query(&[("url", page_url)])
+        .timeout(timeout)
+        .send()
+        .ok()?;
+
+    if !response.status().is_success() {
+        return None;
+    }
+
+    let body = read_text(response, MAX_RESPONSE_BYTES).ok()?;
+    let availability = serde_json::from_str::<Availability>(&body).ok()?;
+    let snapshot = availability.archived_snapshots.closest?;
+
+    if !snapshot.available || snapshot.status != "200" {
+        return None;
+    }
+
+    let replay = format!(
+        "https://web.archive.org/web/{}id_/{}",
+        snapshot.timestamp, page_url
+    );
+
+    verify_image(client, &replay, kind, timeout.min(VERIFY_TIMEOUT), 1).ok()?;
+
+    Some(replay)
+}
+
 pub fn archive(
     client: &Client,
     save_client: &Client,
@@ -222,6 +257,20 @@ mod tests {
         let body = r#"<a href="/web/20261029040720/https://example.com/x">go</a>"#;
         assert_eq!(timestamp_in_body(body), Some("20261029040720".to_string()));
         assert_eq!(timestamp_in_body("<html>no capture</html>"), None);
+    }
+
+    #[test]
+    #[ignore = "hits the Wayback Machine"]
+    fn finds_an_existing_snapshot() {
+        let client = Client::builder()
+            .user_agent(USER_AGENT)
+            .timeout(Duration::from_secs(20))
+            .build()
+            .unwrap();
+        let url = "https://upload.wikimedia.org/wikipedia/commons/4/47/PNG_transparency_demonstration_1.png";
+
+        let snapshot = existing_snapshot(&client, url, None, Duration::from_secs(10));
+        assert!(snapshot.is_some_and(|value| value.starts_with("https://web.archive.org/web/")));
     }
 
     #[test]
