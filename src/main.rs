@@ -5,6 +5,8 @@ mod util;
 
 use std::io::{self, Write};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use reqwest::blocking::Client;
@@ -16,8 +18,16 @@ const MAX_UPLOAD_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_DEADLINE_SECS: u64 = 3600;
 const DEFAULT_DEADLINE_SECS: u64 = 60;
 const DEFAULT_ARCHIVE_BUDGET_SECS: u64 = 8;
+const DEFAULT_RESIZE_PX: u32 = 160;
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(10);
 const URL_CHECK_TIMEOUT: Duration = Duration::from_secs(8);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OutputFormat {
+    Webp,
+    Jpeg,
+    Png,
+}
 
 struct Options {
     verbose: bool,
@@ -25,6 +35,9 @@ struct Options {
     archive_budget: Duration,
     skip_archive: bool,
     skip_permanent: bool,
+    race: bool,
+    resize: u32,
+    format: OutputFormat,
     path: Option<String>,
     cached_url: Option<String>,
     help: bool,
@@ -85,10 +98,17 @@ fn main() {
         }
     }
 
-    let kind = file_data.as_deref().and_then(sniff::detect);
+    let kind: Option<&'static sniff::ImageType> = file_data.as_deref().and_then(sniff::detect);
+    let resize_target = (options.resize > 0).then_some(options.resize);
 
     if let Some(url) = &options.cached_url {
-        if should_reuse_url(&strict_client, url, kind, Duration::from_secs(3)) {
+        if should_reuse_url(
+            &strict_client,
+            url,
+            kind,
+            resize_target,
+            Duration::from_secs(3),
+        ) {
             exit_with_message(url.clone(), 0);
         }
 
@@ -106,7 +126,7 @@ fn main() {
         }
     }
 
-    let data = match file_data {
+    let mut data = match file_data {
         Some(data) => data,
         None => exit_with_message(
             format!(
@@ -119,11 +139,27 @@ fn main() {
         ),
     };
 
+    let mut kind = kind;
     let filepath = filepath.unwrap_or_default();
-    let (mime, extension) = match kind {
+    let (mut mime, mut extension) = match kind {
         Some(kind) => (kind.mime, kind.ext),
         None => sniff::from_extension(Path::new(&filepath)),
     };
+
+    if let Some(target) = resize_target
+        && let Some((resized, resized_mime, resized_extension)) =
+            resize_for_discord(&data, target, options.format)
+    {
+        data = resized;
+        kind = sniff::detect(&data);
+        mime = resized_mime;
+        extension = resized_extension;
+
+        if options.verbose {
+            eprintln!("resized to {}x{} ({} bytes)", target, target, data.len());
+        }
+    }
+
     let filename = format!("image.{}", extension);
 
     let input = providers::Input {
@@ -144,7 +180,61 @@ fn main() {
 
     let mut failures: Vec<String> = Vec::new();
 
-    for provider in providers::CHAIN {
+    if options.race {
+        let candidates: Vec<providers::Provider> = providers::CHAIN
+            .iter()
+            .copied()
+            .filter(|provider| provider.available())
+            .filter(|provider| !(provider.is_permanent() && options.skip_permanent))
+            .collect();
+
+        if candidates.is_empty() {
+            failures.push("race: no providers available".to_string());
+        } else {
+            let timeout = deadline
+                .saturating_duration_since(Instant::now())
+                .min(UPLOAD_TIMEOUT);
+
+            match race_uploads(
+                &client,
+                &strict_client,
+                &candidates,
+                &input,
+                kind,
+                timeout,
+                deadline,
+            ) {
+                Ok(winner) => {
+                    if options.verbose {
+                        eprintln!("race winner: {} {}", winner.provider, winner.url);
+                    }
+                    archive_or_print(
+                        &client,
+                        &strict_client,
+                        winner,
+                        kind,
+                        &options,
+                        archive_deadline,
+                        deadline,
+                    );
+                }
+                Err(errors) => {
+                    failures.extend(errors);
+                    if options.verbose {
+                        eprintln!("race failed; falling back to the permanent host");
+                    }
+                }
+            }
+        }
+    }
+
+    let chain: Vec<providers::Provider> = if options.race {
+        Vec::new()
+    } else {
+        providers::CHAIN.to_vec()
+    };
+
+    for provider in chain {
         if !provider.available() {
             if options.verbose {
                 eprintln!(
@@ -187,61 +277,145 @@ fn main() {
             eprintln!("{} returned {}", uploaded.provider, uploaded.url);
         }
 
-        if options.skip_archive {
-            let check_timeout = deadline
-                .saturating_duration_since(Instant::now())
-                .min(URL_CHECK_TIMEOUT);
-
-            if let Err(error) =
-                util::verify_image(&strict_client, &uploaded.url, kind, check_timeout, 1)
-                && options.verbose
-            {
-                eprintln!(
-                    "warning: {} could not be verified: {}",
-                    uploaded.provider,
-                    error.message()
-                );
-            }
-
-            exit_with_message(uploaded.url, 0);
-        }
-
-        let archived = if Instant::now() >= archive_deadline {
-            Err(archive::ArchiveError {
-                message: "archive time budget exhausted".to_string(),
-                rate_limited: false,
-            })
-        } else {
-            archive::archive(
-                &client,
-                &strict_client,
-                &uploaded.url,
-                kind,
-                archive_deadline,
-            )
-        };
-
-        match archived {
-            Ok(link) => {
-                if options.verbose {
-                    eprintln!("archived {}", link);
-                }
-                cleanup(&client, &uploaded, options.verbose);
-                exit_with_message(link, 0);
-            }
-            Err(error) => {
-                if options.verbose {
-                    eprintln!("warning: {}; returning the direct URL", error.message);
-                }
-                exit_with_message(uploaded.url, 0);
-            }
-        }
+        archive_or_print(
+            &client,
+            &strict_client,
+            uploaded,
+            kind,
+            &options,
+            archive_deadline,
+            deadline,
+        );
     }
 
     exit_with_message(
         format!("error: all options failed\n{}\n", failures.join("\n")),
         1,
     );
+}
+
+fn archive_or_print(
+    client: &Client,
+    strict_client: &Client,
+    uploaded: Uploaded,
+    kind: Option<&sniff::ImageType>,
+    options: &Options,
+    archive_deadline: Instant,
+    deadline: Instant,
+) -> ! {
+    if options.skip_archive {
+        let check_timeout = deadline
+            .saturating_duration_since(Instant::now())
+            .min(URL_CHECK_TIMEOUT);
+
+        if let Err(error) = util::verify_image(strict_client, &uploaded.url, kind, check_timeout, 1)
+            && options.verbose
+        {
+            eprintln!(
+                "warning: {} could not be verified: {}",
+                uploaded.provider,
+                error.message()
+            );
+        }
+
+        exit_with_message(uploaded.url, 0);
+    }
+
+    let archived = if Instant::now() >= archive_deadline {
+        Err(archive::ArchiveError {
+            message: "archive time budget exhausted".to_string(),
+            rate_limited: false,
+        })
+    } else {
+        archive::archive(client, strict_client, &uploaded.url, kind, archive_deadline)
+    };
+
+    match archived {
+        Ok(link) => {
+            if options.verbose {
+                eprintln!("archived {}", link);
+            }
+            cleanup(client, &uploaded, options.verbose);
+            exit_with_message(link, 0);
+        }
+        Err(error) => {
+            if options.verbose {
+                eprintln!("warning: {}; returning the direct URL", error.message);
+            }
+            exit_with_message(uploaded.url, 0);
+        }
+    }
+}
+
+fn race_uploads(
+    client: &Client,
+    strict_client: &Client,
+    candidates: &[providers::Provider],
+    input: &providers::Input<'_>,
+    kind: Option<&'static sniff::ImageType>,
+    timeout: Duration,
+    deadline: Instant,
+) -> Result<Uploaded, Vec<String>> {
+    let (sender, receiver) = mpsc::channel();
+    let data = Arc::new(input.data.to_vec());
+    let filename = Arc::new(input.filename.to_string());
+    let mime = Arc::new(input.mime.to_string());
+
+    for provider in candidates.iter().copied() {
+        let sender = sender.clone();
+        let client = client.clone();
+        let strict_client = strict_client.clone();
+        let data = Arc::clone(&data);
+        let filename = Arc::clone(&filename);
+        let mime = Arc::clone(&mime);
+
+        std::thread::spawn(move || {
+            let input = providers::Input {
+                data: data.as_slice(),
+                filename: filename.as_str(),
+                mime: mime.as_str(),
+            };
+
+            let result = match provider.upload(&client, &input, timeout) {
+                Ok(uploaded) if provider.is_permanent() => match util::verify_image(
+                    &strict_client,
+                    &uploaded.url,
+                    kind,
+                    timeout.min(Duration::from_secs(2)),
+                    1,
+                ) {
+                    Ok(()) | Err(util::VerifyError::Unreachable(_)) => Ok(uploaded),
+                    Err(error) => Err(format!(
+                        "{}: unusable file URL: {}",
+                        provider.name(),
+                        error.message()
+                    )),
+                },
+                result => result,
+            };
+
+            let _ = sender.send(result);
+        });
+    }
+
+    drop(sender);
+
+    let mut failures = Vec::new();
+
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+
+        match receiver.recv_timeout(remaining) {
+            Ok(Ok(uploaded)) => return Ok(uploaded),
+            Ok(Err(error)) => failures.push(error),
+            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    Err(failures)
 }
 
 fn cleanup(client: &Client, uploaded: &Uploaded, verbose: bool) {
@@ -273,6 +447,9 @@ fn parse_args() -> Result<Options, String> {
         archive_budget: Duration::from_secs(DEFAULT_ARCHIVE_BUDGET_SECS),
         skip_archive: false,
         skip_permanent: skip_permanent_from_env(),
+        race: false,
+        resize: DEFAULT_RESIZE_PX,
+        format: OutputFormat::Webp,
         path: None,
         cached_url: None,
         help: false,
@@ -286,6 +463,19 @@ fn parse_args() -> Result<Options, String> {
             "-v" | "--verbose" => options.verbose = true,
             "--skip-archive" => options.skip_archive = true,
             "--no-permanent" => options.skip_permanent = true,
+            "--race" => options.race = true,
+            "--resize" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--resize needs a value in pixels".to_string())?;
+                options.resize = parse_resize(&value)?;
+            }
+            "--format" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--format needs webp, jpeg or png".to_string())?;
+                options.format = parse_format(&value)?;
+            }
             "--deadline" => {
                 let value = args
                     .next()
@@ -303,6 +493,10 @@ fn parse_args() -> Result<Options, String> {
                     options.deadline = parse_deadline(value)?;
                 } else if let Some(value) = arg.strip_prefix("--archive-budget=") {
                     options.archive_budget = parse_archive_budget(value)?;
+                } else if let Some(value) = arg.strip_prefix("--resize=") {
+                    options.resize = parse_resize(value)?;
+                } else if let Some(value) = arg.strip_prefix("--format=") {
+                    options.format = parse_format(value)?;
                 } else if arg.starts_with('-') && arg != "-" {
                     return Err(format!("unknown argument: {}", arg));
                 } else {
@@ -371,6 +565,30 @@ fn parse_archive_budget(value: &str) -> Result<Duration, String> {
     Ok(Duration::from_secs(seconds))
 }
 
+fn parse_resize(value: &str) -> Result<u32, String> {
+    let pixels: u32 = value
+        .parse()
+        .map_err(|_| format!("invalid resize: {}", value))?;
+
+    if pixels != 0 && !(32..=1024).contains(&pixels) {
+        return Err("resize must be 0 or between 32 and 1024 pixels".to_string());
+    }
+
+    Ok(pixels)
+}
+
+fn parse_format(value: &str) -> Result<OutputFormat, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "webp" => Ok(OutputFormat::Webp),
+        "jpeg" | "jpg" => Ok(OutputFormat::Jpeg),
+        "png" => Ok(OutputFormat::Png),
+        _ => Err(format!(
+            "unsupported format: {} (use webp, jpeg or png)",
+            value
+        )),
+    }
+}
+
 fn skip_permanent_from_env() -> bool {
     std::env::var("ARCHIVE_UPLOADER_NO_PERMANENT")
         .map(|value| {
@@ -416,16 +634,120 @@ fn should_reuse_url(
     client: &Client,
     url: &str,
     kind: Option<&sniff::ImageType>,
+    target: Option<u32>,
     timeout: Duration,
 ) -> bool {
     if is_known_unreachable_for_discord(url) {
         return false;
     }
 
-    match util::verify_image(client, url, kind, timeout, 1) {
-        Ok(()) => true,
+    match util::fetch_bytes(client, url, 32 * 1024, timeout) {
+        Ok((prefix, _)) => {
+            if sniff::looks_like_html(&prefix) {
+                return false;
+            }
+
+            if target.is_none()
+                && let Some(kind) = kind
+                && !kind.matches(&prefix)
+            {
+                return false;
+            }
+
+            if let Some(target) = target
+                && let Some((width, height)) = image_dimensions(&prefix)
+                && width.max(height) > target
+            {
+                return false;
+            }
+
+            true
+        }
         Err(util::VerifyError::Mismatch(_)) => false,
         Err(util::VerifyError::Unreachable(_)) => true,
+    }
+}
+
+fn image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()
+}
+
+fn resize_for_discord(
+    data: &[u8],
+    target: u32,
+    format: OutputFormat,
+) -> Option<(Vec<u8>, &'static str, &'static str)> {
+    if data.starts_with(b"GIF8")
+        || (data.starts_with(b"RIFF") && data.len() >= 12 && &data[8..12] == b"WEBP")
+    {
+        return None;
+    }
+
+    let reader = image::ImageReader::new(std::io::Cursor::new(data))
+        .with_guessed_format()
+        .ok()?;
+    let (width, height) = reader.into_dimensions().ok()?;
+
+    if width == 0 || height == 0 || width.max(height) <= target {
+        return None;
+    }
+    if u64::from(width) * u64::from(height) > 80_000_000 {
+        return None;
+    }
+
+    let source = image::load_from_memory(data).ok()?;
+    let side = width.min(height);
+    let cropped = source.crop_imm((width - side) / 2, (height - side) / 2, side, side);
+    let resized = cropped.resize_exact(target, target, image::imageops::FilterType::Lanczos3);
+
+    match format {
+        OutputFormat::Webp => encode_webp(&resized).or_else(|| encode_fallback(&resized)),
+        OutputFormat::Jpeg => encode_jpeg(&resized),
+        OutputFormat::Png => encode_png(&resized),
+    }
+}
+
+fn encode_webp(image: &image::DynamicImage) -> Option<(Vec<u8>, &'static str, &'static str)> {
+    let encoded = if image.color().has_alpha() {
+        let rgba = image.to_rgba8();
+        let (width, height) = rgba.dimensions();
+        webp::Encoder::from_rgba(rgba.as_raw(), width, height).encode(90.0)
+    } else {
+        let rgb = image.to_rgb8();
+        let (width, height) = rgb.dimensions();
+        webp::Encoder::from_rgb(rgb.as_raw(), width, height).encode(90.0)
+    };
+
+    Some((encoded.to_vec(), "image/webp", "webp"))
+}
+
+fn encode_jpeg(image: &image::DynamicImage) -> Option<(Vec<u8>, &'static str, &'static str)> {
+    let mut buffer = Vec::new();
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buffer, 90);
+    encoder.encode_image(&image.to_rgb8()).ok()?;
+    Some((buffer, "image/jpeg", "jpg"))
+}
+
+fn encode_png(image: &image::DynamicImage) -> Option<(Vec<u8>, &'static str, &'static str)> {
+    let mut buffer = Vec::new();
+    image
+        .write_to(
+            &mut std::io::Cursor::new(&mut buffer),
+            image::ImageFormat::Png,
+        )
+        .ok()?;
+    Some((buffer, "image/png", "png"))
+}
+
+fn encode_fallback(image: &image::DynamicImage) -> Option<(Vec<u8>, &'static str, &'static str)> {
+    if image.color().has_alpha() {
+        encode_png(image)
+    } else {
+        encode_jpeg(image)
     }
 }
 
@@ -459,6 +781,10 @@ fn help_text() -> String {
         "      --archive-budget SECS\n",
         "                       Give up on archiving after N seconds and print the\n",
         "                       direct upload URL (default 8, 0 = wait for --deadline)\n",
+        "      --race           Upload to all available hosts at once and use the\n",
+        "                       first successful result\n",
+        "      --resize PX      Downscale artwork to PX (square, Lanczos3; 0 = keep\n",
+        "                       the original; default 160)\n",
         "      --skip-archive   Print the direct host URL instead of archiving it\n",
         "      --no-permanent   Skip hosts that keep permanent copies (catbox);\n",
         "                       also enabled by ARCHIVE_UPLOADER_NO_PERMANENT=1\n",
@@ -529,5 +855,63 @@ mod tests {
         assert!(!is_known_unreachable_for_discord(
             "https://web.archive.org/web/20261029043717id_/https://example.com/a.jpg"
         ));
+    }
+
+    fn sample_png(width: u32, height: u32) -> Vec<u8> {
+        let source = image::RgbImage::from_fn(width, height, |x, y| {
+            image::Rgb([x as u8, y as u8, (x + y) as u8])
+        });
+        let mut data = Vec::new();
+        image::DynamicImage::ImageRgb8(source)
+            .write_to(
+                &mut std::io::Cursor::new(&mut data),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        data
+    }
+
+    #[test]
+    fn downscales_to_square_webp_by_default() {
+        let data = sample_png(400, 200);
+
+        let (resized, mime, extension) =
+            resize_for_discord(&data, 160, OutputFormat::Webp).unwrap();
+
+        assert_eq!(mime, "image/webp");
+        assert_eq!(extension, "webp");
+        assert!(resized.starts_with(b"RIFF"));
+        assert_eq!(image_dimensions(&resized), Some((160, 160)));
+    }
+
+    #[test]
+    fn can_encode_jpeg() {
+        let data = sample_png(400, 400);
+
+        let (resized, mime, extension) =
+            resize_for_discord(&data, 160, OutputFormat::Jpeg).unwrap();
+
+        assert_eq!(mime, "image/jpeg");
+        assert_eq!(extension, "jpg");
+        assert_eq!(image_dimensions(&resized), Some((160, 160)));
+    }
+
+    #[test]
+    fn keeps_images_that_are_already_small() {
+        let source = image::RgbImage::from_fn(100, 100, |_, _| image::Rgb([1, 2, 3]));
+        let mut data = Vec::new();
+        image::DynamicImage::ImageRgb8(source)
+            .write_to(
+                &mut std::io::Cursor::new(&mut data),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+
+        assert!(resize_for_discord(&data, 160, OutputFormat::Webp).is_none());
+    }
+
+    #[test]
+    fn skips_animated_formats() {
+        assert!(resize_for_discord(b"GIF89a\0\0", 160, OutputFormat::Webp).is_none());
     }
 }

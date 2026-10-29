@@ -61,14 +61,15 @@ pub fn parse_web_timestamp(location: &str) -> Option<String> {
     }
 }
 
-pub fn fetch_prefix(
+pub fn fetch_bytes(
     client: &Client,
     url: &str,
+    limit: u64,
     timeout: Duration,
 ) -> Result<(Vec<u8>, Option<String>), VerifyError> {
     let response = client
         .get(url)
-        .header(RANGE, format!("bytes=0-{}", WINDOW - 1))
+        .header(RANGE, format!("bytes=0-{}", limit.saturating_sub(1)))
         .timeout(timeout)
         .send()
         .map_err(|error| VerifyError::Unreachable(error.to_string()))?;
@@ -84,13 +85,21 @@ pub fn fetch_prefix(
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
 
-    let mut prefix = Vec::with_capacity(WINDOW);
+    let mut bytes = Vec::with_capacity(limit.min(64 * 1024) as usize);
     response
-        .take(WINDOW as u64)
-        .read_to_end(&mut prefix)
+        .take(limit)
+        .read_to_end(&mut bytes)
         .map_err(|error| VerifyError::Unreachable(error.to_string()))?;
 
-    Ok((prefix, content_type))
+    Ok((bytes, content_type))
+}
+
+pub fn fetch_prefix(
+    client: &Client,
+    url: &str,
+    timeout: Duration,
+) -> Result<(Vec<u8>, Option<String>), VerifyError> {
+    fetch_bytes(client, url, WINDOW as u64, timeout)
 }
 
 pub fn verify_image(

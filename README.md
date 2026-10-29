@@ -12,7 +12,9 @@ URL as the presence image.
    imgur (optional), litterbox (72 hours), uguu (3 hours), 0x0.st (1 hour),
    tmpfiles (1 hour), catbox. No flags are needed for this default behavior.
 3. Checks that the returned URL is a plain HTTPS URL on the expected host.
-4. Submits the URL to the Wayback Machine, bounded by the archive budget.
+4. Downscales the image to 160x160 by default (center crop, Lanczos3, lossy
+   WebP q90), then submits the URL to the Wayback Machine within the archive
+   budget.
 5. If a snapshot is produced, checks that the archived copy serves the image
    and prints `https://web.archive.org/web/<timestamp>id_/<url>`. Otherwise it
    prints the direct upload URL instead.
@@ -87,6 +89,28 @@ command and passes them as arguments instead of writing to stdin. Configure:
 - The fork's default process timeout is 10 seconds; the uploader aims to answer
   within 8 and otherwise prints the direct URL.
 
+## Parallel upload (--race)
+
+`--race` uploads the image to imgur (when configured), litterbox, uguu, 0x0.st,
+tmpfiles and catbox concurrently, then archives the first successful result.
+Catbox stays enabled unless `--no-permanent` is passed; its returned URLs are
+checked for a live image before they can win, because anonymous catbox uploads
+sometimes 404.
+
+This avoids waiting on a slow or dead first host, but it sends the same file to
+every raced host on every upload. Those extra copies are not cleaned up
+(litterbox/uguu/tmpfiles expire; imgur and catbox copies persist), so use it
+only if the latency matters. Remaining uploads are terminated when the process
+exits after printing the result.
+
+If the archive step fails, the direct fallback can be a catbox URL, which
+Discord's media proxy cannot resolve. The archive URL is the reliable result;
+use `--no-permanent` to keep catbox out of the race entirely.
+
+```
+"C:\path\to\archive-uploader.exe" --race --deadline 120 --archive-budget 90 {filepath} {url}
+```
+
 ## Options
 
 | Option | Description |
@@ -94,6 +118,9 @@ command and passes them as arguments instead of writing to stdin. Configure:
 | `-v`, `--verbose` | Print progress and diagnostics to stderr |
 | `--deadline SECS` | Total time budget in seconds (default 60, max 3600) |
 | `--archive-budget SECS` | Seconds to spend on archiving before printing the direct URL (default 8, 0 = wait for `--deadline`) |
+| `--race` | Upload to all available hosts concurrently and use the first successful result |
+| `--resize PX` | Downscale artwork to PX (square, Lanczos3; default 160, 0 keeps the original) |
+| `--format FMT` | Resized output format: `webp` (lossy q90, default), `jpeg`, or `png` |
 | `--skip-archive` | Print the direct host URL instead of archiving it |
 | `--no-permanent` | Skip catbox, whose anonymous uploads cannot be deleted |
 | `-h`, `--help` | Show help |
@@ -122,5 +149,12 @@ command and passes them as arguments instead of writing to stdin. Configure:
   uploaded as `application/octet-stream` and accepted if the host serves them
   back unchanged.
 - Files larger than 128 MiB are rejected.
+- Discord requests the activity image at `size=160`, so the default `--resize
+  160` sends a pre-scaled, center-cropped image instead of letting the client
+  reduce a 3000 px source in one step. Pass `--resize 0` to upload the original
+  and keep the full-resolution archive capture. Resized output is lossy WebP
+  q90 by default; `--format jpeg` or `--format png` changes it. Discord's external
+  RPC URLs support WebP (including animated WebP), AVIF, GIF, PNG and JPEG.
+  GIF, animated WebP and SVG sources are uploaded unchanged.
 - Save Page Now rate limiting (HTTP 429 or 503) stops the run instead of
   retrying every remaining host.
