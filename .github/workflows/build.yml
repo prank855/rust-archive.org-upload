@@ -31,7 +31,7 @@ jobs:
         uses: actions/github-script@v3
         with:
           script: |
-              core.setFailed('IMGUR_CLIENT_ID secret not set!')
+              core.warning('IMGUR_CLIENT_ID secret not set; building without the imgur fallback.')
   style:
     name: Check Style
     needs: [check-client-id]
@@ -76,25 +76,25 @@ jobs:
 
       - name: Strip binary
         if: ${{ inputs.stripBin == 'true' }}
-        run: strip "target/${{ matrix.target }}/release/imgur-uploader.exe"
+        run: strip "target/${{ matrix.target }}/release/archive-uploader.exe"
 
       - name: Run UPX to reduce binary size
         uses: crazy-max/ghaction-upx@v3
         if: ${{ inputs.compressBin == 'true' }}
         with:
           version: latest
-          files: 'target/${{ matrix.target }}/release/imgur-uploader.exe'
+          files: 'target/${{ matrix.target }}/release/archive-uploader.exe'
           args: -q
 
       - name: Publish
         if: github.event_name != 'workflow_dispatch'
         uses: softprops/action-gh-release@v2
         with:
-            files: 'target/${{ matrix.target }}/release/imgur-uploader.exe'
+            files: 'target/${{ matrix.target }}/release/archive-uploader.exe'
 
       - name: Upload artifact
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
-          name: imgur-uploader.exe
-          path: 'target/${{ matrix.target }}/release/imgur-uploader.exe'
+          name: archive-uploader.exe
+          path: 'target/${{ matrix.target }}/release/archive-uploader.exe'
