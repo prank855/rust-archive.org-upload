@@ -38,6 +38,7 @@ struct Options {
     race: bool,
     resize: u32,
     format: OutputFormat,
+    archive_only: bool,
     path: Option<String>,
     cached_url: Option<String>,
     help: bool,
@@ -107,6 +108,7 @@ fn main() {
             url,
             kind,
             resize_target,
+            options.archive_only,
             Duration::from_secs(3),
         ) {
             exit_with_message(url.clone(), 0);
@@ -339,6 +341,18 @@ fn archive_or_print(
             exit_with_message(link, 0);
         }
         Err(error) => {
+            if options.archive_only {
+                let message = if options.verbose {
+                    format!(
+                        "error: no archive.org URL was produced: {}\n",
+                        error.message
+                    )
+                } else {
+                    "error: no archive.org URL was produced\n".to_string()
+                };
+                exit_with_message(message, 1);
+            }
+
             if options.verbose {
                 eprintln!("warning: {}; returning the direct URL", error.message);
             }
@@ -450,6 +464,7 @@ fn parse_args() -> Result<Options, String> {
         race: false,
         resize: DEFAULT_RESIZE_PX,
         format: OutputFormat::Webp,
+        archive_only: false,
         path: None,
         cached_url: None,
         help: false,
@@ -464,6 +479,7 @@ fn parse_args() -> Result<Options, String> {
             "--skip-archive" => options.skip_archive = true,
             "--no-permanent" => options.skip_permanent = true,
             "--race" => options.race = true,
+            "--archive-only" => options.archive_only = true,
             "--resize" => {
                 let value = args
                     .next()
@@ -504,6 +520,10 @@ fn parse_args() -> Result<Options, String> {
                 }
             }
         }
+    }
+
+    if options.archive_only && options.skip_archive {
+        return Err("--archive-only cannot be combined with --skip-archive".to_string());
     }
 
     let (path, cached_url) = classify_positionals(&positional)?;
@@ -635,9 +655,14 @@ fn should_reuse_url(
     url: &str,
     kind: Option<&sniff::ImageType>,
     target: Option<u32>,
+    archive_only: bool,
     timeout: Duration,
 ) -> bool {
     if is_known_unreachable_for_discord(url) {
+        return false;
+    }
+
+    if archive_only && !is_archive_url(url) {
         return false;
     }
 
@@ -751,6 +776,13 @@ fn encode_fallback(image: &image::DynamicImage) -> Option<(Vec<u8>, &'static str
     }
 }
 
+fn is_archive_url(url: &str) -> bool {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| host == "web.archive.org")
+}
+
 fn is_known_unreachable_for_discord(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return true;
@@ -785,6 +817,10 @@ fn help_text() -> String {
         "                       first successful result\n",
         "      --resize PX      Downscale artwork to PX (square, Lanczos3; 0 = keep\n",
         "                       the original; default 160)\n",
+        "      --format FMT     Resized output format: webp, jpeg or png (default\n",
+        "                       webp, lossy q90)\n",
+        "      --archive-only   Only print web.archive.org URLs; exit 1 instead\n",
+        "                       of printing a direct upload URL\n",
         "      --skip-archive   Print the direct host URL instead of archiving it\n",
         "      --no-permanent   Skip hosts that keep permanent copies (catbox);\n",
         "                       also enabled by ARCHIVE_UPLOADER_NO_PERMANENT=1\n",
@@ -841,6 +877,16 @@ mod tests {
         assert!(
             classify_positionals(&args(&["a.jpg", "https://x/1.jpg", "https://x/2.jpg"])).is_err()
         );
+    }
+
+    #[test]
+    fn archive_urls_are_recognized() {
+        assert!(is_archive_url(
+            "https://web.archive.org/web/20261029053236id_/https://example.com/a.webp"
+        ));
+        assert!(!is_archive_url("https://litter.catbox.moe/a.webp"));
+        assert!(!is_archive_url("https://files.catbox.moe/a.webp"));
+        assert!(!is_archive_url("not a url"));
     }
 
     #[test]

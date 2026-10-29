@@ -20,7 +20,7 @@ URL as the presence image.
 5. Submits the URL to the Wayback Machine within the archive budget.
 6. If a snapshot is produced, verifies that the archived copy is an image and
    prints `https://web.archive.org/web/<timestamp>id_/<url>`. Otherwise it
-   prints the direct upload URL.
+   prints the direct upload URL, or exits 1 when `--archive-only` is set.
 
 The uploader is designed for foo_discord_rich, whose default process timeout is
 10 seconds. Archiving therefore gets an 8-second budget and falls back to the
@@ -81,7 +81,7 @@ as arguments instead of writing to stdin. A working custom command, with the
 fork's process timeout raised to 130 seconds in the Uploader tab:
 
 ```
-"C:\path\to\archive-uploader.exe" --race --deadline 120 --archive-budget 90 {filepath} {url}
+"C:\path\to\archive-uploader.exe" --archive-only --race --deadline 120 --archive-budget 90 {filepath} {url}
 ```
 
 - A cached URL is reused only if it still serves an image and, when resizing,
@@ -89,6 +89,10 @@ fork's process timeout raised to 130 seconds in the Uploader tab:
   `files.catbox.moe` URLs are replaced.
 - `{blur_percent}` is ignored; use the fork's bundled uploader if you need
   blurred artwork.
+- With `--archive-only`, cached non-archive URLs are rejected and an archive
+  failure returns no URL, so nothing new is cached. Remove `{url}` from the
+  command if you also want failures to leave the album unresolved instead of
+  letting the fork reuse a previously cached URL.
 - The fork merges stderr into stdout, so never pass `--verbose` to the command:
   any diagnostic text corrupts the URL it reads.
 - Inspect cached URLs with the fork's title-format fields `%drp_artwork_url%`,
@@ -123,6 +127,7 @@ use `--no-permanent` to keep catbox out of the race entirely.
 | `--race` | Upload to all available hosts concurrently and use the first successful result |
 | `--resize PX` | Center-crop and downscale to `PX x PX` (default 160, 0 keeps the original) |
 | `--format FMT` | Resized output: `webp` (lossy q90, default), `jpeg`, or `png` (lossless) |
+| `--archive-only` | Only print `web.archive.org` URLs; exit 1 instead of printing a direct upload URL |
 | `--skip-archive` | Print the direct host URL instead of archiving it |
 | `--no-permanent` | Skip catbox, whose anonymous uploads cannot be deleted |
 | `-h`, `--help` | Show help |
@@ -147,7 +152,8 @@ use `--no-permanent` to keep catbox out of the race entirely.
   errors, including HTTP 503. HTTP 429 stops the retries.
 - If the archive is slow or unavailable, the tool exits 0 with the direct upload
   URL instead of failing. That URL is temporary for litterbox, uguu and
-  tmpfiles; imgur and catbox are permanent.
+  tmpfiles; imgur and catbox are permanent. With `--archive-only`, the tool
+  instead exits 1 without printing a URL.
 - Resized output is lossy WebP q90 by default. `--format png` preserves every
   pixel; `--format jpeg` uses JPEG q90. Discord's external RPC URLs support
   WebP (including animated WebP), AVIF, GIF, PNG and JPEG.
