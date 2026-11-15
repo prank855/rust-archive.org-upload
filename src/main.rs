@@ -104,6 +104,12 @@ fn main() {
     let resize_target = (options.resize > 0).then_some(options.resize);
 
     if let Some(url) = &options.cached_url {
+        let cached_client = if is_archive_url(url) {
+            &client
+        } else {
+            &strict_client
+        };
+
         if (options.discord_safe || options.archive_only)
             && !is_archive_url(url)
             && cached_content_ok(&strict_client, url, resize_target, Duration::from_secs(3))
@@ -115,20 +121,29 @@ fn main() {
             if let Some(upgraded) =
                 upgrade_cached_url(&client, &strict_client, url, archive_deadline)
             {
-                exit_with_message(upgraded, 0);
+                if validate_output(&client, &upgraded, None, deadline).is_ok() {
+                    exit_with_message(upgraded, 0);
+                }
+
+                if options.verbose {
+                    eprintln!("archive link failed validation");
+                }
             }
 
             if options.verbose {
                 eprintln!("no archive link available for the cached URL");
             }
 
-            if options.discord_safe && is_discord_safe_url(url) {
+            if options.discord_safe
+                && is_discord_safe_url(url)
+                && validate_output(&strict_client, url, None, deadline).is_ok()
+            {
                 exit_with_message(url.clone(), 0);
             }
         }
 
         if should_reuse_url(
-            &strict_client,
+            cached_client,
             url,
             kind,
             resize_target,
@@ -136,7 +151,13 @@ fn main() {
             options.discord_safe,
             Duration::from_secs(3),
         ) {
-            exit_with_message(url.clone(), 0);
+            if options.discord_safe || options.archive_only {
+                if validate_output(cached_client, url, None, deadline).is_ok() {
+                    exit_with_message(url.clone(), 0);
+                }
+            } else {
+                exit_with_message(url.clone(), 0);
+            }
         }
 
         if file_data.is_none() {
@@ -359,15 +380,8 @@ fn archive_or_print(
                 ));
             }
 
-            match util::verify_image(strict_client, &uploaded.url, kind, check_timeout, 1) {
-                Ok(()) | Err(util::VerifyError::Unreachable(_)) => {}
-                Err(error) => {
-                    return Err(format!(
-                        "{}: could not be verified: {}",
-                        uploaded.provider,
-                        error.message()
-                    ));
-                }
+            if let Err(error) = validate_output(strict_client, &uploaded.url, kind, deadline) {
+                return Err(format!("{}: {}", uploaded.provider, error));
             }
         } else if let Err(error) =
             util::verify_image(strict_client, &uploaded.url, kind, check_timeout, 1)
@@ -396,6 +410,12 @@ fn archive_or_print(
         Ok(link) => {
             if options.discord_safe && !is_discord_safe_url(&link) {
                 return Err(format!("archive URL is not Discord-safe: {}", link));
+            }
+
+            if (options.discord_safe || options.archive_only)
+                && let Err(error) = validate_output(client, &link, kind, deadline)
+            {
+                return Err(format!("archive URL failed validation: {}", error));
             }
 
             if options.verbose {
@@ -432,23 +452,11 @@ fn archive_or_print(
                     ));
                 }
 
-                let verify_timeout = deadline
-                    .saturating_duration_since(Instant::now())
-                    .min(Duration::from_secs(2));
-
-                if verify_timeout.is_zero() {
-                    exit_with_message(uploaded.url, 0);
-                }
-
-                match util::verify_image(strict_client, &uploaded.url, kind, verify_timeout, 1) {
-                    Ok(()) | Err(util::VerifyError::Unreachable(_)) => {}
-                    Err(error) => {
-                        return Err(format!(
-                            "{}: direct URL could not be verified: {}",
-                            uploaded.provider,
-                            error.message()
-                        ));
-                    }
+                if let Err(error) = validate_output(strict_client, &uploaded.url, kind, deadline) {
+                    return Err(format!(
+                        "{}: direct URL failed validation: {}",
+                        uploaded.provider, error
+                    ));
                 }
 
                 exit_with_message(uploaded.url, 0);
@@ -803,6 +811,38 @@ fn should_reuse_url(
     }
 }
 
+fn validate_output(
+    client: &Client,
+    url: &str,
+    kind: Option<&sniff::ImageType>,
+    deadline: Instant,
+) -> Result<(), String> {
+    let mut last_error = String::from("no time left to verify the URL");
+
+    for attempt in 0..2 {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining < Duration::from_millis(500) {
+            break;
+        }
+
+        let timeout = remaining.min(Duration::from_secs(3));
+        match util::verify_image(client, url, kind, timeout, 1) {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = error.message().to_string(),
+        }
+
+        if attempt == 0 {
+            let pause =
+                Duration::from_millis(500).min(deadline.saturating_duration_since(Instant::now()));
+            if !pause.is_zero() {
+                std::thread::sleep(pause);
+            }
+        }
+    }
+
+    Err(last_error)
+}
+
 fn cached_content_ok(client: &Client, url: &str, target: Option<u32>, timeout: Duration) -> bool {
     match util::fetch_bytes(client, url, 32 * 1024, timeout) {
         Ok((prefix, _)) => {
@@ -832,7 +872,7 @@ fn upgrade_cached_url(
 ) -> Option<String> {
     let timeout = deadline
         .saturating_duration_since(Instant::now())
-        .min(Duration::from_secs(4));
+        .min(Duration::from_secs(8));
 
     if !timeout.is_zero()
         && let Some(archive_url) = archive::existing_snapshot(client, url, None, timeout)

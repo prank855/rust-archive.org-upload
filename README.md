@@ -104,6 +104,11 @@ fork's process timeout raised to 130 seconds in the Uploader tab:
   and otherwise attempts a capture. A successful upgrade returns the archive
   URL; otherwise `--discord-safe` returns the direct URL when it is on the safe
   allowlist, and unsafe cached URLs are regenerated.
+- In these modes every returned URL is fetched again before printing (two
+  attempts). A URL that fails TLS, times out, or does not serve an image is not
+  returned; the tool tries the next host or regenerates. A local TLS block (for
+  example from an antivirus) can still make a link fail after it was printed;
+  archive.org links are the most reliable.
 - The fork merges stderr into stdout, so never pass `--verbose` to the command:
   any diagnostic text corrupts the URL it reads.
 - Inspect cached URLs with the fork's title-format fields `%drp_artwork_url%`,
