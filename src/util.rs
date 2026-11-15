@@ -143,6 +143,36 @@ pub fn verify_image(
     })
 }
 
+const PROXY_BASE: &str = "https://wsrv.nl/";
+
+fn proxy_url(url: &str) -> Option<String> {
+    let mut proxy = reqwest::Url::parse(PROXY_BASE).ok()?;
+    proxy
+        .query_pairs_mut()
+        .append_pair("url", url)
+        .append_pair("n", "-1");
+    Some(proxy.to_string())
+}
+
+pub fn verify_image_via_proxy(
+    client: &Client,
+    url: &str,
+    timeout: Duration,
+) -> Result<(), VerifyError> {
+    let proxy = proxy_url(url)
+        .ok_or_else(|| VerifyError::Unreachable("could not build proxy URL".to_string()))?;
+    let (prefix, content_type) = fetch_prefix(client, &proxy, timeout)?;
+
+    if sniff::detect(&prefix).is_some() {
+        Ok(())
+    } else {
+        Err(VerifyError::Mismatch(format!(
+            "proxy returned no image data (content-type: {})",
+            content_type.as_deref().unwrap_or("unknown")
+        )))
+    }
+}
+
 fn check_image(
     client: &Client,
     url: &str,
@@ -184,6 +214,15 @@ mod tests {
         );
         assert_eq!(parse_web_timestamp("/web/2026/https://example.com/"), None);
         assert_eq!(parse_web_timestamp("https://example.com/"), None);
+    }
+
+    #[test]
+    fn builds_encoded_proxy_url() {
+        let proxy = proxy_url("https://d.uguu.se/a.webp?x=1").unwrap();
+        assert_eq!(
+            proxy,
+            "https://wsrv.nl/?url=https%3A%2F%2Fd.uguu.se%2Fa.webp%3Fx%3D1&n=-1"
+        );
     }
 
     #[test]

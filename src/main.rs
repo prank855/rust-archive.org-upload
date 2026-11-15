@@ -828,7 +828,13 @@ fn validate_output(
         let timeout = remaining.min(Duration::from_secs(3));
         match util::verify_image(client, url, kind, timeout, 1) {
             Ok(()) => return Ok(()),
-            Err(error) => last_error = error.message().to_string(),
+            Err(util::VerifyError::Mismatch(message)) => last_error = message,
+            Err(util::VerifyError::Unreachable(message)) => {
+                if let Ok(()) = util::verify_image_via_proxy(client, url, timeout) {
+                    return Ok(());
+                }
+                last_error = message;
+            }
         }
 
         if attempt == 0 {

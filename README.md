@@ -106,9 +106,11 @@ fork's process timeout raised to 130 seconds in the Uploader tab:
   allowlist, and unsafe cached URLs are regenerated.
 - In these modes every returned URL is fetched again before printing (two
   attempts). A URL that fails TLS, times out, or does not serve an image is not
-  returned; the tool tries the next host or regenerates. A local TLS block (for
-  example from an antivirus) can still make a link fail after it was printed;
-  archive.org links are the most reliable.
+  returned; the tool tries the next host or regenerates. If the local network
+  blocks the file host's TLS while the upload endpoint works (some ISPs deny
+  `d.uguu.se` and `litter.catbox.moe` with a fatal `access denied` alert), the
+  URL is retried through the wsrv.nl image proxy, so a globally reachable file
+  is still verified. Archive.org links remain the most reliable.
 - The fork merges stderr into stdout, so never pass `--verbose` to the command:
   any diagnostic text corrupts the URL it reads.
 - Inspect cached URLs with the fork's title-format fields `%drp_artwork_url%`,
